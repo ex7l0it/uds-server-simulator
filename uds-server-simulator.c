@@ -45,7 +45,7 @@ long change_to_non_default_session_microseconds = 0;     // microseconds part
 const long S3Server_timer = 5;                           // default 5s
 
 int current_session_mode = 1;           // default session mode(1), only support 1 and 3 in this version.
-int current_security_level = 0;         // default not unlocked(0), only support 3 and 19 in this version.
+int current_security_level = 0;         // default not unlocked(0), only support 3, 19 and 21 in this version.
 int current_security_phase_3 = 0;       // default 0, there are two phases: 1 and 2.
 int current_security_phase_19 = 0;      // default 0, there are two phases: 1 and 2.
 int current_security_phase_21 = 0;      // default 0, there are two phases: 1 and 2.
@@ -58,6 +58,15 @@ uint8_t tmp_store[8] = {0};
 
 int flow_control_flag = 0;              // 0-false 1-true
 uint8_t st_min = 0;                     // us
+
+/* This space is for $34 and $35 */
+uint8_t *firmwareSpace = NULL;
+int SPACE_SIZE = 128 * 1024;        // 128K
+int req_transfer_data_len = 0;
+int req_transfer_data_add = 0;
+int req_transfer_type = 0;           // 0x34 or 0x35
+int req_transfer_block_num = 0;
+int req_transfer_block_counter = 0;
 
 /* This is for $22 flow control packets */
 uint8_t gBuffer[256] = {0};
@@ -191,6 +200,11 @@ void uds_server_init(cJSON *root, char *ecu) {
         isValueJsonString(CURRENT_ECU);
         current_ecu = CURRENT_ECU->valuestring;
     }
+
+    // 128K
+    firmwareSpace = malloc(SPACE_SIZE);
+    char* test_str = "Hello world";
+    strncpy(firmwareSpace, test_str, strlen(test_str));
 
     // for(int i=0; i<strlen(current_ecu); i++){
     //     *(current_ecu+i) = lower2upper(*(current_ecu+i));
@@ -922,6 +936,106 @@ void io_control_by_did(int can, struct can_frame frame) {
             return;
     }
 }
+
+void request_upload(int can, struct can_frame frame) {
+    u_int8_t dataFormatIdentifier = frame.data[2];
+    u_int8_t addressAndLengthFormatIdentifier = frame.data[3];
+    // high 4 bits is memoryAddressLength, low 4 bits is memorySizeLength
+    u_int8_t memoryAddressLength = (addressAndLengthFormatIdentifier & 0xF0) >> 4;
+    u_int8_t memorySizeLength = addressAndLengthFormatIdentifier & 0x0F;
+    u_int8_t memoryAddress = 0;
+    u_int8_t memorySize = 0;
+    if (memoryAddressLength > 2 || memorySizeLength > 2) {
+        send_negative_response(can, UDS_SID_REQUEST_UPLOAD, REQUEST_OUT_OF_RANGE);
+        return;
+    }
+    // get memoryAddress and memorySize 
+    for (int i = 0; i < memoryAddressLength; i++) {
+        memoryAddress = memoryAddress << 8;
+        memoryAddress += frame.data[4+i];
+    }
+    for (int i = 0; i < memorySizeLength; i++) {
+        memorySize = memorySize << 8;
+        memorySize += frame.data[4+memoryAddressLength+i];
+    }    
+
+    if (memoryAddress + memorySize > SPACE_SIZE) {
+        send_negative_response(can, UDS_SID_REQUEST_UPLOAD, REQUEST_OUT_OF_RANGE);
+        return;
+    }
+    req_transfer_data_add = memoryAddress;
+    req_transfer_data_len = memorySize;
+    
+    req_transfer_type = 0x35;
+    // 计算所需数据块数量 (除 127 结果向上取整)
+    req_transfer_block_num = (req_transfer_data_len + 127 - 1) / 127;
+
+    struct can_frame resp;
+    resp.can_id = diag_phy_resp_id;
+    resp.can_dlc = 8;
+    resp.data[0] = 0x04;
+    resp.data[1] = frame.data[1] + 0x40;
+    resp.data[2] = 0x20;    // lengthFormatIdentifier
+    resp.data[3] = 0x00;    // maximumNumberBlockLength: 0x0081
+    resp.data[4] = 0x81;
+    resp.data[5] = 0x00;
+    resp.data[6] = 0x00;
+    resp.data[7] = 0x00;
+    write(can, &resp, CAN_MTU);
+}
+
+void transfer_data(int can, struct can_frame frame) {
+    u_int8_t sequenceNumber = frame.data[2];
+    u_int8_t buffer[129] = {0};
+
+    if (sequenceNumber > req_transfer_block_num || sequenceNumber == 0) {
+        send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_OUT_OF_RANGE);
+        return;
+    }
+    if (sequenceNumber != req_transfer_block_counter+1 && sequenceNumber != req_transfer_block_counter) {
+        send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
+        return;
+    }
+
+    // Upload
+    if (req_transfer_type == 0x35) {
+        int max_block_len = req_transfer_data_len > 127 ? 127 : req_transfer_data_len;
+        int block_len = (req_transfer_data_len - (sequenceNumber-1)*127) > 127 ? max_block_len : (req_transfer_data_len - (sequenceNumber-1)*127);
+        memcpy(buffer+2, &firmwareSpace[req_transfer_data_add + (sequenceNumber-1)*127], block_len);
+
+        buffer[0] = frame.data[1] + 0x40;
+        buffer[1] = sequenceNumber;
+        isotp_send_to(can, buffer, block_len + 2);
+        req_transfer_block_counter++;
+    }
+    // Download
+    if (req_transfer_type == 0x34) {
+
+    }
+    
+}
+
+void xfer_exit(int can, struct can_frame frame) {
+    struct can_frame resp;
+    resp.can_id = diag_phy_resp_id;
+    resp.can_dlc = 8;
+    resp.data[0] = 0x01;
+    resp.data[1] = frame.data[1] + 0x40;
+    resp.data[2] = 0x00;
+    resp.data[3] = 0x00;
+    resp.data[4] = 0x00;
+    resp.data[5] = 0x00;
+    resp.data[6] = 0x00;
+    resp.data[7] = 0x00;
+    write(can, &resp, CAN_MTU);
+    // reset
+    req_transfer_data_add = 0;
+    req_transfer_data_len = 0;
+    req_transfer_block_num = 0;
+    req_transfer_block_counter = 0;
+    req_transfer_type = 0x00;
+}
+
 /********************************** Service Implement End **********************************/
 
 
@@ -1076,6 +1190,57 @@ void handle_pkt(int can, struct can_frame frame) {
                     send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
                     return;
                 } 
+            case UDS_SID_REQUEST_DOWNLOAD:      // SID 0x34
+                // TODO
+                return;
+            case UDS_SID_REQUEST_UPLOAD:        // SID 0x35
+                if (current_session_mode != 0x02) {
+                    // MUST in programming session mode
+                    send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
+                    return;
+                } else if (current_security_level == 0x00) {
+                    // MUST unlock the security access (level >= 0x19)
+                    send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
+                    return;
+                } else {
+                    request_upload(can, frame);
+                    return;
+                }
+                return;
+            case UDS_SID_TRANSFER_DATA:         // SID 0x36
+                if (current_session_mode != 0x02) {
+                    // MUST in programming session mode
+                    send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
+                    return;
+                } else if (current_security_level == 0x00) {
+                    // MUST unlock the security access (level >= 0x19)
+                    send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
+                    return;
+                } else if (req_transfer_type != 0x34 && req_transfer_type != 0x35) {
+                    send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
+                    return;
+                } else {
+                    transfer_data(can, frame);
+                    return;
+                }
+                return;
+            case UDS_SID_REQUEST_XFER_EXIT:
+                if (current_session_mode != 0x02) {
+                    // MUST in programming session mode
+                    send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
+                    return;
+                } else if (current_security_level == 0x00) {
+                    // MUST unlock the security access (level >= 0x19)
+                    send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
+                    return;
+                } else if (req_transfer_type != 0x34 && req_transfer_type != 0x35) {
+                    send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
+                    return;
+                } else {
+                    xfer_exit(can, frame);
+                    return;
+                }
+
             default:
                 send_negative_response(can, sid, SERVICE_NOT_SUPPORTED);
                 return;
@@ -1148,6 +1313,7 @@ void handle_pkt(int can, struct can_frame frame) {
             flow_control_push_to(can);
             flow_control_flag = 0;
         }
+
     }
 }
 
