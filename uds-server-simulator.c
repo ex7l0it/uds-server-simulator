@@ -61,7 +61,7 @@ uint8_t st_min = 0;                     // us
 
 /* This space is for $34 and $35 */
 uint8_t *firmwareSpace = NULL;
-int SPACE_SIZE = 128 * 1024;        // 128K
+int SPACE_SIZE = 64 * 1024;        // 64K
 int req_transfer_data_len = 0;
 int req_transfer_data_add = 0;
 int req_transfer_type = 0;           // 0x34 or 0x35
@@ -202,7 +202,7 @@ void uds_server_init(cJSON *root, char *ecu) {
         current_ecu = CURRENT_ECU->valuestring;
     }
 
-    // 128K
+    // 64K
     firmwareSpace = malloc(SPACE_SIZE);
     char* test_str = "Hello world";
     strncpy(firmwareSpace, test_str, strlen(test_str));
@@ -251,8 +251,14 @@ void reset_relevant_variables() { // when session mode changed
     ggBufSize = 0;
     ggBufLengthRemaining = 0;
     ggBufCounter = 0;
+    ggSID = 0;
     memset(ggBuffer, 0, sizeof(ggBuffer));
     memset(tmp_store, 0, sizeof(tmp_store));
+    req_transfer_data_len = 0;
+    req_transfer_data_add = 0;
+    req_transfer_type = 0;
+    req_transfer_block_num = 0;
+    req_transfer_block_counter = 0;
 }
 
 void udelay(int min) {
@@ -972,7 +978,7 @@ void request_download_or_upload(int can, struct can_frame frame, int sid) {
     req_transfer_data_len = memorySize;
     
     req_transfer_type = sid;
-    // 计算所需数据块数量 (除 127 结果向上取整)
+    // Calculate the number of data blocks required (divide by 127 to round up the result)
     req_transfer_block_num = (req_transfer_data_len + 127 - 1) / 127;
 
     struct can_frame resp;
@@ -995,7 +1001,6 @@ void transfer_data(int can, struct can_frame frame) {
     u_int8_t buffer[129] = {0};
 
     if (sequenceNumber > req_transfer_block_num || sequenceNumber == 0) {
-        printf("sequenceNumber: %d, req_transfer_block_num: %d\n", sequenceNumber, req_transfer_block_num);
         send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_OUT_OF_RANGE);
         return;
     }
@@ -1253,6 +1258,7 @@ void handle_pkt(int can, struct can_frame frame) {
                     return;
                 } else if (req_transfer_type != 0) {
                     send_negative_response(can, sid, CONDITIONS_NOT_CORRECT);
+                    return;
                 } else {
                     request_download_or_upload(can, frame, sid);
                     return;
