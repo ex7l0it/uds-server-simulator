@@ -93,6 +93,20 @@ Examples:
 
     Have a happy UDS hacking!
 
+### TransferData
+
+This simulator now is support the 0x34, 0x35, 0x36, 0x37 services. You can perform the following upload and download operations to the simulated memory space:
+
+1. Enter the programming session.
+2. Request for security access.
+3. Send download or upload request. (Available space: `0x00000 - 0x20000`)
+    - eg. `703#0734002200000019`
+        - `0022`: fixed hard-coded: uncompressed and unencrypted, memoryAddressLength and memorySizeLength are both 2 bytes
+        - `0000`: memoryAddress
+        - `0019`: memorySize
+4. Transferdata.
+5. RequestTransferExit.
+
 ## Acknowledgments
 The software refers to some excellent open source projects.
 

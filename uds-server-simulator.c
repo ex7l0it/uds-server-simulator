@@ -74,11 +74,12 @@ int gBufSize = 0;
 int gBufLengthRemaining = 0;
 int gBufCounter = 0;
 
-/* This is for $2E flow control packets */
+/* This is for $2E and $36 flow control packets */
 uint8_t ggBuffer[256] = {0};
 int ggBufSize = 0;
 int ggBufLengthRemaining = 0;
 int ggBufCounter = 0;
+int ggSID = 0;
 
 
 /********************************** DID Supported Start **********************************/
@@ -449,7 +450,7 @@ void isotp_send_to(int can, uint8_t *data, int size) {  // referred to Craig Smi
 int isSubFunctionSupported(int sid, int sf) {
     switch (sid) {
         case UDS_SID_DIAGNOSTIC_CONTROL:
-            if (sf == 0x01 || sf == 0x03) 
+            if (sf == 0x01 || sf == 0x02 || sf == 0x03) 
                 return 0;
             break;
         case UDS_SID_TESTER_PRESENT:
@@ -508,6 +509,9 @@ int isIncorrectMessageLengthOrInvalidFormat(struct can_frame frame) {
                 if (first_byte >= 0x04 && first_byte <= 0x05)
                     return 0;
                 break;
+            case UDS_SID_REQUEST_XFER_EXIT:
+                if (first_byte == 0x01)
+                    return 0;
             default:
                 if (first_byte >= 0x02 && first_byte <= 0x07)
                     return 0;
@@ -766,6 +770,7 @@ void write_data_by_id(int can, struct can_frame frame) {
         ggBufSize = ((frame.data[0] & 0x0000000F) << 8) | frame.data[1];
         ggBufSize-=3;
         ggBufCounter = 0x21;
+        ggSID = UDS_SID_WRITE_DATA_BY_ID;
         ggBufLengthRemaining = ggBufSize - 3;
         memset(ggBuffer, 0, sizeof(ggBuffer));   // clear the original value
         strncpy(ggBuffer, &frame.data[5], 3);
@@ -937,7 +942,7 @@ void io_control_by_did(int can, struct can_frame frame) {
     }
 }
 
-void request_upload(int can, struct can_frame frame) {
+void request_download_or_upload(int can, struct can_frame frame, int sid) {
     u_int8_t dataFormatIdentifier = frame.data[2];
     u_int8_t addressAndLengthFormatIdentifier = frame.data[3];
     // high 4 bits is memoryAddressLength, low 4 bits is memorySizeLength
@@ -966,7 +971,7 @@ void request_upload(int can, struct can_frame frame) {
     req_transfer_data_add = memoryAddress;
     req_transfer_data_len = memorySize;
     
-    req_transfer_type = 0x35;
+    req_transfer_type = sid;
     // 计算所需数据块数量 (除 127 结果向上取整)
     req_transfer_block_num = (req_transfer_data_len + 127 - 1) / 127;
 
@@ -985,10 +990,12 @@ void request_upload(int can, struct can_frame frame) {
 }
 
 void transfer_data(int can, struct can_frame frame) {
-    u_int8_t sequenceNumber = frame.data[2];
+    char first_char = int2nibble(frame.data[0], 0);
+    u_int8_t sequenceNumber = first_char == '0' ? frame.data[2]: frame.data[3];
     u_int8_t buffer[129] = {0};
 
     if (sequenceNumber > req_transfer_block_num || sequenceNumber == 0) {
+        printf("sequenceNumber: %d, req_transfer_block_num: %d\n", sequenceNumber, req_transfer_block_num);
         send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_OUT_OF_RANGE);
         return;
     }
@@ -996,9 +1003,58 @@ void transfer_data(int can, struct can_frame frame) {
         send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
         return;
     }
+    if (sequenceNumber == req_transfer_block_counter) {
+        req_transfer_block_counter--;
+    }
+    
+    if (req_transfer_type == UDS_SID_REQUEST_DOWNLOAD) {
+        int max_block_len = req_transfer_data_len > 127 ? 127 : req_transfer_data_len;
+        struct can_frame resp;
+        if (first_char == '0') {
+            // reset taget memory space
+            memset(&firmwareSpace[req_transfer_data_add + (sequenceNumber-1)*max_block_len], 0, max_block_len);
 
-    // Upload
-    if (req_transfer_type == 0x35) {
+            resp.can_id = diag_phy_resp_id;
+            resp.can_dlc = 8;
+            resp.data[0] = 0x02;
+            resp.data[1] = frame.data[1] + 0x40;
+            resp.data[2] = ++req_transfer_block_counter;
+            resp.data[3] = 0x00;
+            resp.data[4] = 0x00;
+            resp.data[5] = 0x00;
+            resp.data[6] = 0x00;
+            resp.data[7] = 0x00;
+            write(can, &resp, CAN_MTU);
+        }
+        if (first_char == '1') {
+            ggBufSize = ((frame.data[0] & 0x0000000F) << 8) | frame.data[1];
+            ggBufSize -= 2;
+            if (ggBufSize != req_transfer_data_len) {
+                send_negative_response(can, UDS_SID_TRANSFER_DATA, TRANSFER_DATA_SUSPENDED);
+                ggBufSize = 0;
+                return;
+            }
+            ggBufCounter = 0x21;
+            ggSID = UDS_SID_TRANSFER_DATA;
+            ggBufLengthRemaining = ggBufSize - 4;
+            memset(ggBuffer, 0, sizeof(ggBuffer));   // clear the original value
+            memcpy(ggBuffer, &frame.data[4], 4);
+
+            resp.can_id = diag_phy_resp_id;
+            resp.can_dlc = 8;
+            resp.data[0] = 0x30;
+            resp.data[1] = 0x00;
+            resp.data[2] = 0x0F;
+            resp.data[3] = 0x00;
+            resp.data[4] = 0x00;
+            resp.data[5] = 0x00;
+            resp.data[6] = 0x00;
+            resp.data[7] = 0x00;
+            write(can, &resp, CAN_MTU);
+        }
+    }
+
+    if (req_transfer_type == UDS_SID_REQUEST_UPLOAD) {
         int max_block_len = req_transfer_data_len > 127 ? 127 : req_transfer_data_len;
         int block_len = (req_transfer_data_len - (sequenceNumber-1)*127) > 127 ? max_block_len : (req_transfer_data_len - (sequenceNumber-1)*127);
         memcpy(buffer+2, &firmwareSpace[req_transfer_data_add + (sequenceNumber-1)*127], block_len);
@@ -1008,11 +1064,6 @@ void transfer_data(int can, struct can_frame frame) {
         isotp_send_to(can, buffer, block_len + 2);
         req_transfer_block_counter++;
     }
-    // Download
-    if (req_transfer_type == 0x34) {
-
-    }
-    
 }
 
 void xfer_exit(int can, struct can_frame frame) {
@@ -1190,30 +1241,29 @@ void handle_pkt(int can, struct can_frame frame) {
                     send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
                     return;
                 } 
-            case UDS_SID_REQUEST_DOWNLOAD:      // SID 0x34
-                // TODO
-                return;
-            case UDS_SID_REQUEST_UPLOAD:        // SID 0x35
+            case UDS_SID_REQUEST_DOWNLOAD:
+            case UDS_SID_REQUEST_UPLOAD:      // SID 0x34 or 0x35
                 if (current_session_mode != 0x02) {
                     // MUST in programming session mode
                     send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
                     return;
                 } else if (current_security_level == 0x00) {
-                    // MUST unlock the security access (level >= 0x19)
+                    // MUST unlock the security access
                     send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
                     return;
+                } else if (req_transfer_type != 0) {
+                    send_negative_response(can, sid, CONDITIONS_NOT_CORRECT);
                 } else {
-                    request_upload(can, frame);
+                    request_download_or_upload(can, frame, sid);
                     return;
                 }
-                return;
             case UDS_SID_TRANSFER_DATA:         // SID 0x36
                 if (current_session_mode != 0x02) {
                     // MUST in programming session mode
                     send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
                     return;
                 } else if (current_security_level == 0x00) {
-                    // MUST unlock the security access (level >= 0x19)
+                    // MUST unlock the security access
                     send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
                     return;
                 } else if (req_transfer_type != 0x34 && req_transfer_type != 0x35) {
@@ -1223,7 +1273,6 @@ void handle_pkt(int can, struct can_frame frame) {
                     transfer_data(can, frame);
                     return;
                 }
-                return;
             case UDS_SID_REQUEST_XFER_EXIT:
                 if (current_session_mode != 0x02) {
                     // MUST in programming session mode
@@ -1233,7 +1282,7 @@ void handle_pkt(int can, struct can_frame frame) {
                     // MUST unlock the security access (level >= 0x19)
                     send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
                     return;
-                } else if (req_transfer_type != 0x34 && req_transfer_type != 0x35) {
+                } else if (req_transfer_type != 0x34 && req_transfer_type != 0x35 || (req_transfer_block_counter != req_transfer_block_num)) {
                     send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
                     return;
                 } else {
@@ -1267,28 +1316,50 @@ void handle_pkt(int can, struct can_frame frame) {
             } else {
                 memcpy(ggBuffer + (ggBufSize - ggBufLengthRemaining), &frame.data[1], ggBufLengthRemaining);
                 ggBufLengthRemaining = 0;
-                unsigned char bytes[] = {tmp_store[1], tmp_store[2]};   //	two bytes of DID
-                unsigned int did = (bytes[0] << 8) | bytes[1];          //	DID hex int value
-                for(int i=0; i<DID_NUM; i++) {
-                    if(pairs[i].key == did) {
-                        memset(pairs[i].value, 0, sizeof(pairs[i].value));    // clear the original value
-                        strncpy(pairs[i].value, ggBuffer, strlen(ggBuffer));
+                if (ggSID == UDS_SID_WRITE_DATA_BY_ID) {
+                    unsigned char bytes[] = {tmp_store[1], tmp_store[2]};   //	two bytes of DID
+                    unsigned int did = (bytes[0] << 8) | bytes[1];          //	DID hex int value
+                    for(int i=0; i<DID_NUM; i++) {
+                        if(pairs[i].key == did) {
+                            memset(pairs[i].value, 0, sizeof(pairs[i].value));    // clear the original value
+                            strncpy(pairs[i].value, ggBuffer, strlen(ggBuffer));
+                        }
                     }
+                    struct can_frame resp;
+                    resp.can_id = diag_phy_resp_id;
+                    resp.can_dlc = 8;
+                    resp.data[0] = 0x03;
+                    resp.data[1] = tmp_store[0] + 0x40;
+                    resp.data[2] = tmp_store[1];
+                    resp.data[3] = tmp_store[2];
+                    resp.data[4] = 0x00;
+                    resp.data[5] = 0x00;
+                    resp.data[6] = 0x00;
+                    resp.data[7] = 0x00;
+                    write(can, &resp, CAN_MTU);
+                    memset(tmp_store, 0, sizeof(tmp_store));
+                    memset(ggBuffer, 0, sizeof(ggBuffer));
                 }
-                struct can_frame resp;
-                resp.can_id = diag_phy_resp_id;
-                resp.can_dlc = 8;
-                resp.data[0] = 0x03;
-                resp.data[1] = tmp_store[0] + 0x40;
-                resp.data[2] = tmp_store[1];
-                resp.data[3] = tmp_store[2];
-                resp.data[4] = 0x00;
-                resp.data[5] = 0x00;
-                resp.data[6] = 0x00;
-                resp.data[7] = 0x00;
-                write(can, &resp, CAN_MTU);
-                memset(tmp_store, 0, sizeof(tmp_store));
-                memset(ggBuffer, 0, sizeof(ggBuffer));
+                if (ggSID == UDS_SID_TRANSFER_DATA) {
+                    memcpy(ggBuffer + (ggBufSize - ggBufLengthRemaining), &frame.data[1], ggBufLengthRemaining);
+                    int max_block_len = req_transfer_data_len > 127 ? 127 : req_transfer_data_len;
+                    int start_add = req_transfer_data_add + req_transfer_block_counter*max_block_len;
+                    memcpy(&firmwareSpace[start_add], ggBuffer, max_block_len);
+
+                    struct can_frame resp;
+                    resp.can_id = diag_phy_resp_id;
+                    resp.can_dlc = 8;
+                    resp.data[0] = 0x02;
+                    resp.data[1] = tmp_store[0] + 0x40;
+                    resp.data[2] = ++req_transfer_block_counter;
+                    resp.data[3] = 0x00;
+                    resp.data[4] = 0x00;
+                    resp.data[5] = 0x00;
+                    resp.data[6] = 0x00;
+                    resp.data[7] = 0x00;
+                    write(can, &resp, CAN_MTU);
+                    memset(ggBuffer, 0, sizeof(ggBuffer));
+                }
             }
         }
         return;
