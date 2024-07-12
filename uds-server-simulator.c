@@ -52,7 +52,8 @@ int current_security_phase_21 = 0;      // default 0, there are two phases: 1 an
 uint8_t *current_seed_3 = NULL;         // store the current 27's seed of security level 0x03.
 uint8_t *current_seed_19 = NULL;        // store the current 27's seed of security level 0x19.
 uint8_t *current_seed_21 = NULL;        // store the current 27's seed of security level 0x21.
-int security_access_error_attempt = 0;  // store service 27 error attempt number, only limit sl 19.
+int security_access_error_attempt = 0;  // store service 27 error attempt number, only limit sl 19 and 21.
+unsigned long security_access_lock_time = 0;      // store the lock time of security access, only limit sl 19 and 21.
 
 uint8_t tmp_store[8] = {0};
 
@@ -293,8 +294,7 @@ unsigned int get_did_from_frame(struct can_frame frame) {
 
 uint8_t *seed_generate(int sl) {
     uint8_t *seed_ptr = (uint8_t *)malloc(sizeof(uint8_t) * 4); // store 27's 4-byte seed
-    
-    if (sl == 0x03) {
+    if (sl == 0x03 || sl == current_security_level) {
         seed_ptr[0] = 0x00;
         seed_ptr[1] = 0x00;
         seed_ptr[2] = 0x00;
@@ -702,18 +702,19 @@ void read_data_by_id(int can, struct can_frame frame) {
     gBufCounter = 0;
 
     unsigned int did = get_did_from_frame(frame);
+    
+    if (isRequestSecurityAccessMember(did) == 0) {
+        int nrc_33 = isSecurityAccessDenied(did);
+        if (nrc_33 != 0) {
+            send_negative_response(can, UDS_SID_READ_DATA_BY_ID, nrc_33);
+            return;
+        }
+    }
+
     int nrc_31 = isRequestOutOfRange(did);
     if (nrc_31 != 0) {
         send_negative_response(can, UDS_SID_READ_DATA_BY_ID, nrc_31);
         return;
-    }
-
-    if (isRequestSecurityAccessMember(did) == 0) {
-        int nrc_33 = isSecurityAccessDenied(did);
-        if (nrc_33 != 0) {
-            send_negative_response(can, UDS_SID_WRITE_DATA_BY_ID, nrc_33);
-            return;
-        }
     }
  
     uint8_t str[256] = {0};
@@ -819,17 +820,19 @@ void security_access(int can, struct can_frame frame) {
         resp.data[6] = *(seedp+3);
         resp.data[7] = 0x00;
         write(can, &resp, CAN_MTU);
-        if (sl == 0x03) {
-            current_seed_3 = seedp;
-            current_security_phase_3 = 1;
-        }
-        if (sl == 0x19) {
-            current_seed_19 = seedp;
-            current_security_phase_19 = 1;
-        }
-        if (sl == 0x21) {
-            current_seed_21 = seedp;
-            current_security_phase_21 = 1;
+        if (sl != current_security_level) {
+            if (sl == 0x03) {
+                current_seed_3 = seedp;
+                current_security_phase_3 = 1;
+            }
+            if (sl == 0x19) {
+                current_seed_19 = seedp;
+                current_security_phase_19 = 1;
+            }
+            if (sl == 0x21) {
+                current_seed_21 = seedp;
+                current_security_phase_21 = 1;
+            }
         }
         return;
     }
@@ -879,6 +882,7 @@ void security_access(int can, struct can_frame frame) {
                 current_security_phase_21 = 2;
                 security_access_error_attempt = 0;
             }
+            security_access_lock_time = 0;
         } else {    // key is incorrect
             send_negative_response(can, UDS_SID_SECURITY_ACCESS, INVALID_KEY);
             if (sl == 0x04) {
@@ -896,6 +900,8 @@ void security_access(int can, struct can_frame frame) {
         /* determine the service 27 error attempt number is exceed or not */
         if (security_access_error_attempt >= SECURITY_ACCESS_ERROR_LIMIT_NUM) {
             send_negative_response(can, UDS_SID_SECURITY_ACCESS, EXCEED_NUMBER_OF_ATTEMPTS);
+            // store currect time
+            security_access_lock_time = time(NULL);
         }
         /* reset the global variables current_seed_* */
         if (sl == 0x04) {
@@ -1228,6 +1234,10 @@ void handle_pkt(int can, struct can_frame frame) {
                         return;
                     if (isSFExisted(can, sid, sf) == -1) 
                         return;
+                    if (security_access_lock_time != 0 && (time(NULL) - security_access_lock_time) < SECURITY_ACCESS_LOCK_DELAY) {
+                        send_negative_response(can, sid, REQUIRED_TIME_DELAY_NOT_EXPIRED);
+                        return;
+                    }
                     security_access(can, frame);
                     return;
                 } else {    // default session mode
