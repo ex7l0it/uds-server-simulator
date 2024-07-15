@@ -960,10 +960,15 @@ void request_download_or_upload(int can, struct can_frame frame, int sid) {
     // high 4 bits is memoryAddressLength, low 4 bits is memorySizeLength
     u_int8_t memoryAddressLength = (addressAndLengthFormatIdentifier & 0xF0) >> 4;
     u_int8_t memorySizeLength = addressAndLengthFormatIdentifier & 0x0F;
-    u_int8_t memoryAddress = 0;
-    u_int8_t memorySize = 0;
+    u_int32_t memoryAddress = 0;
+    u_int32_t memorySize = 0;
+    // nrc13 check
+    if (frame.data[0] != 3+memoryAddressLength+memorySizeLength) {
+        send_negative_response(can, sid, INCORRECT_MESSAGE_LENGTH_OR_INVALID_FORMAT);
+        return;
+    }
     if (memoryAddressLength > 2 || memorySizeLength > 2) {
-        send_negative_response(can, UDS_SID_REQUEST_UPLOAD, REQUEST_OUT_OF_RANGE);
+        send_negative_response(can, sid, REQUEST_OUT_OF_RANGE);
         return;
     }
     // get memoryAddress and memorySize 
@@ -974,10 +979,9 @@ void request_download_or_upload(int can, struct can_frame frame, int sid) {
     for (int i = 0; i < memorySizeLength; i++) {
         memorySize = memorySize << 8;
         memorySize += frame.data[4+memoryAddressLength+i];
-    }    
-
-    if (memoryAddress + memorySize > SPACE_SIZE) {
-        send_negative_response(can, UDS_SID_REQUEST_UPLOAD, REQUEST_OUT_OF_RANGE);
+    }
+    if (memoryAddress + memorySize >= SPACE_SIZE) {
+        send_negative_response(can, sid, REQUEST_OUT_OF_RANGE);
         return;
     }
     req_transfer_data_add = memoryAddress;
@@ -1050,6 +1054,8 @@ void transfer_data(int can, struct can_frame frame) {
             ggBufLengthRemaining = ggBufSize - 4;
             memset(ggBuffer, 0, sizeof(ggBuffer));   // clear the original value
             memcpy(ggBuffer, &frame.data[4], 4);
+
+            tmp_store[0] = frame.data[2];   // SID
 
             resp.can_id = diag_phy_resp_id;
             resp.can_dlc = 8;
@@ -1283,7 +1289,7 @@ void handle_pkt(int can, struct can_frame frame) {
                     send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
                     return;
                 } else if (req_transfer_type != 0x34 && req_transfer_type != 0x35) {
-                    send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
+                    send_negative_response(can, sid, REQUEST_SEQUENCE_ERROR);
                     return;
                 } else {
                     transfer_data(can, frame);
@@ -1294,12 +1300,8 @@ void handle_pkt(int can, struct can_frame frame) {
                     // MUST in programming session mode
                     send_negative_response(can, sid, SERVICE_NOT_SUPPORTED_IN_ACTIVE_SESSION);
                     return;
-                } else if (current_security_level == 0x00) {
-                    // MUST unlock the security access (level >= 0x19)
-                    send_negative_response(can, sid, SECURITY_ACCESS_DENIED);
-                    return;
                 } else if (req_transfer_type != 0x34 && req_transfer_type != 0x35 || (req_transfer_block_counter != req_transfer_block_num)) {
-                    send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
+                    send_negative_response(can, sid, REQUEST_SEQUENCE_ERROR);
                     return;
                 } else {
                     xfer_exit(can, frame);
