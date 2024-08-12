@@ -1018,12 +1018,17 @@ void transfer_data(int can, struct can_frame frame) {
         send_negative_response(can, UDS_SID_TRANSFER_DATA, REQUEST_SEQUENCE_ERROR);
         return;
     }
-    if (sequenceNumber == req_transfer_block_counter) {
-        req_transfer_block_counter--;
+    if (first_char == '0') {
+        if (sequenceNumber == req_transfer_block_counter) {
+            req_transfer_block_counter--;
+        }
     }
+    
     
     if (req_transfer_type == UDS_SID_REQUEST_DOWNLOAD) {
         int max_block_len = req_transfer_data_len > 127 ? 127 : req_transfer_data_len;
+        int remain_block_data_len = req_transfer_data_len - (sequenceNumber-1)*max_block_len;
+        remain_block_data_len = remain_block_data_len > 127 ? 127 : remain_block_data_len;
         struct can_frame resp;
         if (first_char == '0') {
             // reset taget memory space
@@ -1044,7 +1049,7 @@ void transfer_data(int can, struct can_frame frame) {
         if (first_char == '1') {
             ggBufSize = ((frame.data[0] & 0x0000000F) << 8) | frame.data[1];
             ggBufSize -= 2;
-            if (ggBufSize != req_transfer_data_len) {
+            if (ggBufSize > remain_block_data_len) {
                 send_negative_response(can, UDS_SID_TRANSFER_DATA, TRANSFER_DATA_SUSPENDED);
                 ggBufSize = 0;
                 return;
